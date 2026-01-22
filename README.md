@@ -1,11 +1,14 @@
 # ISL-VEH-REG-HACKING
 
-This is a multi-platform, multi-threaded Rust tool with an egui-based GUI that finds basic registration info for a given Islamabad registered car's license plate number.
+This is a multi-platform, multi-threaded Rust tool with an egui-based GUI that finds basic registration info for a given Islamabad registered car's license plate number. The whole thing was coded with Claude.
 
 ---
 
 ## How does this work?
 The Islamabad Excise portal requires both a registration number and a registration date to display vehicle information. This tool automates the search by taking a user-defined date range, splitting it into segments, and assigning each segment to a thread. Each thread then systematically queries the API until the correct date is identified. All requests are sent to a publically available server that any one can access.
+
+## Is there any rate-limiting/CAPTCHAs/bot protection?
+No, but the Taxation and Excise Department may implement it; so this program may not work if they do, since a lot of requests are sent, which would surely trigger any normal bot protection.
 
 ## Q/A
 ### Is this illegal? / Is this hacking?
