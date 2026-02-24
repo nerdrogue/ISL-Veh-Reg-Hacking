@@ -62,13 +62,9 @@ jobs:
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.target }}
       
       - name: Build with optimization and LTO
-        run: |
-          cargo build --release --target ${{ matrix.target }} \
-            -Z build-std=std,panic_abort \
-            -Z unstable-options
+        run: cargo build --release --target ${{ matrix.target }}
         env:
           RUSTFLAGS: "-C opt-level=3 -C lto=fat -C codegen-units=1"
-          CARGO_CFG_TARGET_FEATURE: "+crt-static"
       
       - name: Strip binary (Linux)
         if: matrix.target == 'x86_64-unknown-linux-gnu'
