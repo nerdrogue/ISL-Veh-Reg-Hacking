@@ -41,6 +41,8 @@ struct VehicleChecker {
     checked_items: Arc<Mutex<usize>>,
     total_items: Arc<Mutex<usize>>,
 
+    start_time: Option<std::time::Instant>,
+
     status_text: String,
     results_dir: PathBuf,
 }
@@ -65,6 +67,7 @@ impl Default for VehicleChecker {
             found_count: Arc::new(Mutex::new(0)),
             checked_items: Arc::new(Mutex::new(0)),
             total_items: Arc::new(Mutex::new(0)),
+            start_time: None,
             status_text: "Ready".to_string(),
             results_dir,
         }
@@ -128,6 +131,16 @@ impl VehicleChecker {
                 max_id = num_str.parse::<u64>().ok();
             }
         }
+
+        // Fallback for the new response format: [{"ID":"1258161",...}]
+        if max_id.is_none() {
+            if let Some(idx) = text.find("\"ID\":") {
+                let id_str = text[idx + 5..].split(|c: char| !c.is_numeric()).find(|s| !s.is_empty());
+                if let Some(num_str) = id_str {
+                    max_id = num_str.parse::<u64>().ok();
+                }
+            }
+        }
         max_id.ok_or_else(|| format!("Could not extract max ID: {}", text))
     }
 
@@ -161,6 +174,7 @@ impl VehicleChecker {
         *self.found_count.lock().unwrap() = 0;
         *self.checked_items.lock().unwrap() = 0;
         *self.total_items.lock().unwrap() = total_items as usize;
+        self.start_time = Some(std::time::Instant::now());
 
         self.log(format!("Starting check for chassis: {}", chassis_no), LogLevel::Info);
         self.log(format!("ID Range: 0 to {}", max_id), LogLevel::Info);
@@ -330,8 +344,9 @@ impl VehicleChecker {
         self.is_running.store(true, Ordering::SeqCst);
         self.record_found.store(false, Ordering::SeqCst);
         *self.found_count.lock().unwrap() = 0;
-        *self.checked_dates.lock().unwrap() = 0;
-        *self.total_dates.lock().unwrap() = total_days as usize;
+        *self.checked_items.lock().unwrap() = 0;
+        *self.total_items.lock().unwrap() = total_days as usize;
+        self.start_time = Some(std::time::Instant::now());
 
         self.log(format!("Starting check for vehicle: {}", vehicle_no), LogLevel::Info);
         self.log(format!("Date range: {} to {}", start_date_str, end_date_str), LogLevel::Info);
@@ -600,6 +615,32 @@ impl eframe::App for VehicleChecker {
             self.status_text = format!("Running... ({}/{})", checked_items, total_items);
         }
 
+        let mut eta_text = String::new();
+        if is_running {
+            if let Some(start) = self.start_time {
+                let elapsed = start.elapsed().as_secs_f64();
+                if checked_items > 0 && elapsed > 0.0 {
+                    let items_per_sec = checked_items as f64 / elapsed;
+                    let remaining_items = total_items.saturating_sub(checked_items);
+                    let remaining_secs = remaining_items as f64 / items_per_sec;
+                    
+                    let hours = (remaining_secs / 3600.0) as u64;
+                    let mins = ((remaining_secs % 3600.0) / 60.0) as u64;
+                    let secs = (remaining_secs % 60.0) as u64;
+                    
+                    if hours > 0 {
+                        eta_text = format!("ETA: {}h {}m {}s ( {:.2} req/s )", hours, mins, secs, items_per_sec);
+                    } else if mins > 0 {
+                        eta_text = format!("ETA: {}m {}s ( {:.2} req/s )", mins, secs, items_per_sec);
+                    } else {
+                        eta_text = format!("ETA: {}s ( {:.2} req/s )", secs, items_per_sec);
+                    }
+                } else {
+                    eta_text = "Calculating ETA...".to_string();
+                }
+            }
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Vehicle Registration Checker");
             ui.add_space(10.0);
@@ -646,7 +687,7 @@ impl eframe::App for VehicleChecker {
 
                     ui.horizontal(|ui| {
                         ui.label("Number of Threads:");
-                        ui.add(egui::Slider::new(&mut self.num_threads, 1..=100));
+                        ui.add(egui::Slider::new(&mut self.num_threads, 1..=1024));
                     });
 
                     ui.add_space(10.0);
@@ -701,6 +742,13 @@ impl eframe::App for VehicleChecker {
                             .show_percentage()
                             .text(progress_text)
                         );
+
+                        if !eta_text.is_empty() {
+                            ui.add_space(5.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(eta_text);
+                            });
+                        }
                     }
                 });
             });
