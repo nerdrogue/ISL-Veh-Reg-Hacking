@@ -550,7 +550,7 @@ impl VehicleChecker {
             *count += 1;
         }
 
-        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        let _timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
         let status_prefix = if status != 200 {
             format!("HTTP{}_", status)
         } else {
