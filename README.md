@@ -1,5 +1,45 @@
 # ISL-VEH-REG-HACKING
 
+DEAD
+THIS PROJECT IS DEAD
+THE SERVER THIS APP TALKED TO IS DEAD
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 This is a multi-platform, multi-threaded Rust tool with an egui-based GUI that finds basic registration info for a given Islamabad registered car's license plate number. The whole thing was coded with Claude.
 
 ---
